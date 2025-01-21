@@ -4,6 +4,7 @@ import os
 import json
 from tqdm import tqdm
 import shortuuid
+import copy
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.conversation import conv_templates, SeparatorStyle
@@ -29,6 +30,89 @@ def split_list(lst, n):
 def get_chunk(lst, n, k):
     chunks = split_list(lst, n)
     return chunks[k]
+
+def preprocess_llama3(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False,
+    max_len=2048,
+    system_message: str = "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+) -> Dict:
+    # roles = {"human": "<|start_header_id|>user<|end_header_id|>", "gpt": "<|start_header_id|>assistant<|end_header_id|>"}
+    roles = {"human": "user", "gpt": "assistant"}
+    # Add image tokens to tokenizer as a special tokens
+    # Use a deepcopy of tokenizer so that we don't modify on the tokenizer
+    tokenizer = copy.deepcopy(tokenizer)
+    # When there is actually an image, we add the image tokens as a special token
+    if has_image:
+        tokenizer.add_tokens(["<image>"], special_tokens=True)
+    image_token_index = tokenizer.convert_tokens_to_ids("<image>")
+    bos_token_id = tokenizer.convert_tokens_to_ids("<|begin_of_text|>")
+    start_header_id = tokenizer.convert_tokens_to_ids("<|start_header_id|>")
+    end_header_id = tokenizer.convert_tokens_to_ids("<|end_header_id|>")
+    eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+
+    unmask_tokens = ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "\n\n"]
+    unmask_tokens_idx = [tokenizer.convert_tokens_to_ids(tok) for tok in unmask_tokens]
+
+    # After update, calling tokenizer of llama3 will
+    # auto add bos id for the tokens. ヽ(｀⌒´)ﾉ
+    def safe_tokenizer_llama3(text):
+        input_ids = tokenizer(text).input_ids
+        if input_ids[0] == bos_token_id:
+            input_ids = input_ids[1:]
+        return input_ids
+
+    nl_tokens = tokenizer.convert_tokens_to_ids("\n\n")
+    # Apply prompt templates
+    input_ids, targets = [], []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != roles["human"]:
+            source = source[1:]
+
+        input_id, target = [], []
+
+        # New version, use apply chat template
+        # Build system message for each sentence
+        input_id += tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}])
+        print(tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}], tokenize=False))
+        target += [IGNORE_INDEX] * len(input_id)
+
+        for conv in source:
+            # Make sure llava data can load
+            try:
+                role = conv["role"]
+                content = conv["content"]
+            except:
+                role = conv["from"]
+                content = conv["value"]
+
+            role =  roles.get(role, role)
+            
+            conv = [{"role" : role, "content" : content}]
+            print(conv)
+            # First is bos token we don't need here
+            encode_id = tokenizer.apply_chat_template(conv)[1:]
+            print(tokenizer.apply_chat_template(conv, tokenize=False))
+            input_id += encode_id
+            if role in ["user", "system"]:
+                target += [IGNORE_INDEX] * len(encode_id)
+            else:
+                target += encode_id
+        
+
+                    
+        assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
+        for idx, encode_id in enumerate(input_id):
+            if encode_id in unmask_tokens_idx:
+                target[idx] = encode_id
+            if encode_id == image_token_index:
+                input_id[idx] = IMAGE_TOKEN_INDEX
+        input_ids.append(input_id)
+        targets.append(target)
+    input_ids = torch.tensor(input_ids, dtype=torch.long)
+    targets = torch.tensor(targets, dtype=torch.long)
+    return input_ids
 
 def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False, max_len=2048, system_message: str = "You are a helpful assistant.") -> Dict:
     roles = {"human": "<|im_start|>user", "gpt": "<|im_start|>assistant"}
@@ -93,30 +177,25 @@ def eval_model(args):
 
     # Data
     with open(os.path.expanduser(args.question_file)) as f:
-        questions = json.load(f)
+        questions = [json.loads(l) for l in f]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
-    
     for line in tqdm(questions):
-        idx = line["sample_id"]
-        question_type = line["metadata"]["question_type"]
-        dataset_name = line["metadata"]["dataset"]
-        gt = line["conversations"][1]["value"]
+        idx = line["question_id"]
+        gt = line["answer"]
 
-        image_files = line["image"]
-        qs = line["conversations"][0]["value"]
+        image_files = [line["image"]]
+        qs = "<image>\n" + line["text"]
         cur_prompt = args.extra_prompt + qs
 
-        args.conv_mode = "qwen_1_5"
-
-        conv = conv_templates[args.conv_mode].copy()
+        conv = copy.deepcopy(conv_templates[args.conv_mode])
         conv.append_message(conv.roles[0], qs)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
 
-        input_ids = preprocess_qwen([line["conversations"][0],{'from': 'gpt','value': None}], tokenizer, has_image=True).cuda()
+        input_ids = preprocess_llama3([[{'from': 'human', 'value': qs},{'from': 'gpt','value': None}]], tokenizer, has_image=True, system_message=conv.system).cuda()
         img_num = list(input_ids.squeeze()).count(IMAGE_TOKEN_INDEX)
 
         image_tensors = []
@@ -126,9 +205,9 @@ def eval_model(args):
             image_tensors.append(image_tensor.half().cuda())
         # image_tensors = torch.cat(image_tensors, dim=0)
 
-        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        keywords = [stop_str]
-        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+        # stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        # keywords = [stop_str]
+        # stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
 
         with torch.inference_mode():
             output_ids = model.generate(
@@ -142,80 +221,22 @@ def eval_model(args):
                 max_new_tokens=1024,
                 use_cache=True)
 
-        
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=False)[0]
         outputs = outputs.strip()
-        if outputs.endswith(stop_str):
-            outputs = outputs[:-len(stop_str)]
+        # if outputs.endswith(stop_str):
+        #     outputs = outputs[:-len(stop_str)]
         outputs = outputs.strip()
 
         ans_id = shortuuid.uuid()
         ans_file.write(json.dumps({
-                                   "dataset": dataset_name,
                                    "sample_id": idx,
                                    "prompt": cur_prompt,
                                    "pred_response": outputs,
                                    "gt_response": gt,
                                    "shortuuid": ans_id,
                                    "model_id": model_name,
-                                   "question_type": question_type,
                                    }) + "\n")
         ans_file.flush()
-
-        if len(line["conversations"]) > 2:
-
-            for i in range(2, len(line["conversations"]), 2):
-                input_ids = torch.cat((input_ids, output_ids), dim=1)
-
-                gt = line["conversations"][i + 1]["value"]
-                qs = line["conversations"][i]["value"]
-                cur_prompt = args.extra_prompt + qs
-
-                args.conv_mode = "qwen_1_5"
-
-                conv = conv_templates[args.conv_mode].copy()
-                conv.append_message(conv.roles[0], qs)
-                conv.append_message(conv.roles[1], None)
-                prompt = conv.get_prompt()
-
-                input_ids_new = preprocess_qwen([line["conversations"][i],{'from': 'gpt','value': None}], tokenizer, has_image=True).cuda()
-                input_ids = torch.cat((input_ids, input_ids_new), dim=1)
-                img_num = list(input_ids_new.squeeze()).count(IMAGE_TOKEN_INDEX)
-
-                stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-                keywords = [stop_str]
-                stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
-                with torch.inference_mode():
-                    output_ids = model.generate(
-                        input_ids,
-                        images=image_tensors,
-                        do_sample=True if args.temperature > 0 else False,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        num_beams=args.num_beams,
-                        # no_repeat_ngram_size=3,
-                        max_new_tokens=1024,
-                        use_cache=True)
-        
-                outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-                outputs = outputs.strip()
-                if outputs.endswith(stop_str):
-                    outputs = outputs[:-len(stop_str)]
-                outputs = outputs.strip()
-
-                ans_id = shortuuid.uuid()
-                ans_file.write(json.dumps({
-                                        "dataset": dataset_name,
-                                        "sample_id": idx,
-                                        "prompt": cur_prompt,
-                                        "pred_response": outputs,
-                                        "gt_response": gt,
-                                        "shortuuid": ans_id,
-                                        "model_id": model_name,
-                                        "question_type": question_type,
-                                        }) + "\n")
-                ans_file.flush()
 
 
     ans_file.close()
