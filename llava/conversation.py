@@ -396,6 +396,19 @@ conv_llava_llama_3 = Conversation(
     stop_token_ids=[128009],
 )
 
+conv_llava_llama_3_1 = Conversation(
+    system="You are a helpful language and vision assistant. " "You are able to understand the visual content that the user provides, " "and assist the user with a variety of tasks using natural language.",
+    roles=("user", "assistant"),
+    version="llama_v3_1",
+    messages=[],
+    offset=0,
+    sep="<|eot_id|>",
+    sep_style=SeparatorStyle.LLAMA_3,
+    tokenizer_id="meta-llama/Llama-3.1-8B-Instruct",
+    tokenizer=safe_load_tokenizer("meta-llama/Llama-3.1-8B-Instruct"),
+    stop_token_ids=[128009],
+)
+
 conv_mistral_instruct = Conversation(
     system="",
     roles=("USER", "ASSISTANT"),
@@ -571,6 +584,7 @@ conv_templates = {
     "llava_v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
     "llava_llama_3": conv_llava_llama_3,
+    "llava_llama_3_1": conv_llava_llama_3_1,
     "llava_llama_2_simple": conv_llava_llama_2_simple,
     "llava_llama_2_mmtag": conv_llava_llama_2_mmtag,
     "llava_mistral_instruct": conv_mistral_instruct,
