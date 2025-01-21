@@ -718,6 +718,77 @@ def preprocess_llama3(
         labels=targets,  # tensor(bs x seq_len)
     )
 
+def preprocess_llama3_1(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False,
+    max_len=2048,
+    system_message: str = "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+) -> Dict:
+    # roles = {"human": "<|start_header_id|>user<|end_header_id|>", "gpt": "<|start_header_id|>assistant<|end_header_id|>"}
+    roles = {"human": "user", "gpt": "assistant"}
+
+    # Add image tokens to tokenizer as a special tokens
+    # Use a deepcopy of tokenizer so that we don't modify on the tokenizer
+    tokenizer = copy.deepcopy(tokenizer)
+    # When there is actually an image, we add the image tokens as a special token
+    if has_image:
+        tokenizer.add_tokens(["<image>"], special_tokens=True)
+    image_token_index = tokenizer.convert_tokens_to_ids("<image>")
+
+    cur_conv = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != roles["human"]:
+            source = source[1:]
+
+        # New version, use apply chat template
+        # Build system message for each sentence
+        cur_conv.append({"role" : "system", "content" : system_message})
+        # input_id += tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}])
+
+        for conv in source:
+            # Make sure llava data can load
+            try:
+                role = conv["role"]
+                content = conv["content"]
+            except:
+                role = conv["from"]
+                content = conv["value"]
+
+            role = roles.get(role, role)
+            
+            cur_conv.append({"role" : role, "content" : content})
+            # First is bos token we don't need here
+            # encode_id = tokenizer.apply_chat_template(conv)[1:]
+        
+
+    input_ids = tokenizer.apply_chat_template(cur_conv, return_tensors="pt")
+    for idx, encode_id in enumerate(input_ids[0]):
+        if encode_id == image_token_index:
+            input_ids[0][idx] = IMAGE_TOKEN_INDEX
+
+    assistant_tokens = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<|start_header_id|>assistant<|end_header_id|>\n\n"))
+    user_tokens = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<|start_header_id|>user<|end_header_id|>\n\n"))
+    labels = [IGNORE_INDEX] * len(input_ids[0])
+
+    is_assistant_msg = False
+    for idx, token in enumerate(input_ids[0]):
+        if not is_assistant_msg:
+            if idx + len(assistant_tokens) <= len(input_ids[0]) and assistant_tokens == input_ids[0][idx: idx + len(assistant_tokens)].tolist():
+                is_assistant_msg = True
+                labels[idx] = token
+        else:
+            labels[idx] = token
+            if idx + len(user_tokens) <= len(input_ids[0]) and user_tokens == input_ids[0][idx: idx + len(user_tokens)].tolist():
+                is_assistant_msg = False
+                labels[idx] = IGNORE_INDEX
+    input_ids = torch.tensor(input_ids, dtype=torch.long)
+    labels = torch.tensor(labels, dtype=torch.long).unsqueeze(0)
+        
+    return dict(
+        input_ids=input_ids,  # tensor(bs x seq_len)
+        labels=labels,  # tensor(bs x seq_len)
+    )
 
 def preprocess_v1(sources, tokenizer: transformers.PreTrainedTokenizer, has_image: bool = False) -> Dict:
     conv = conversation_lib.default_conversation.copy()
@@ -923,6 +994,8 @@ def preprocess(sources: Sequence[str], tokenizer: transformers.PreTrainedTokeniz
         return preprocess_gemma(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "llama_v3":
         return preprocess_llama3(sources, tokenizer, has_image=has_image)
+    if conversation_lib.default_conversation.version == "llama_v3_1":
+        return preprocess_llama3_1(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
