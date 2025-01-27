@@ -27,6 +27,8 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
         return ImageBindWrapper(vision_tower, args=vision_tower_cfg, **kwargs)
     elif vision_tower.startswith("open_clip_hub"):
         return OpenCLIPVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
+    elif is_absolute_path_exists and "biomed_clip" in vision_tower or vision_tower == "ikim-uk-essen/BiomedCLIP_ViT_patch16_224":
+        return ViTVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
     # elif "internal-eva" in vision_tower.lower() or "eva02" in vision_tower.lower():
     #     return EvaClipVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
     # elif vision_tower in ["EVA-CLIP-8B", "EVA-CLIP-8B-plus"]:
